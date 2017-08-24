@@ -1,4 +1,4 @@
-baseurl: "https://nonrandom.net/"
+baseurl: "http://nonrandom.net/"
 languageCode: "en-us"
 title: "David J. Harris"
 theme: "hugo-lithium-theme"
