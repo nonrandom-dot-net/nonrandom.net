@@ -1,0 +1,217 @@
+---
+title: Avoiding integrals in statistics
+author: David J. Harris
+date: '2017-08-22'
+categories:
+  - Approximation
+  - Integration
+  - Latent variables
+  - Monte Carlo
+  - Statistics
+  - Variational methods
+slug: avoiding-integrals-in-statistics
+---
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(cowplot)
+library(viridis)
+library(rethinking)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Why integrate?
+
+independent random events whose intensity is drawn from a gamma distribution.
+
+, so we can just use
+`dnbinom` in R, or `scipy.stats.nbinom.pmf` in python. But what if 
+
+```{r}
+set.seed(1)
+N = 1000
+shape = 4
+rate = 1
+xmax = 12
+posterior_height = .04
+```
+
+```{r}
+curve(dgamma(x, shape, rate), to = xmax, yaxs = "i", bty = "l",
+      n = 1000, ylim = c(0, 1), ylab = "Probability")
+prob = 1 / (1 + 1/rate)
+lines(0:100, dnbinom(0:100, size = shape, prob = prob), col = "darkred",
+      type = "h")
+lines(0, dnbinom(0, size = shape, prob = prob), type = "h", col = 2, lwd = 3)
+```
+
+```{r}
+curve(dgamma(x, shape, rate), to = xmax, yaxs = "i", bty = "l",
+      n = 1000, ylim = c(0, 1), ylab = "Probability")
+curve(dpois(0, x), to = xmax, add = TRUE, col = 2)
+arrows(5, .4, 2, .2, lwd = 2, length = .125)
+```
+If the intensity has a typical value lik 5 or 10, we *could* still get unlucky 
+and get nothing, but it wouldn't be very likely. Alternatively, if the intensity
+is less than 1, then we wouldn't expect anything, but those extremely low 
+intensities are pretty rare. And what about all the values in between?
+
+```{r}
+likelihood = function(lambda){
+  dpois(0, lambda) * dgamma(lambda, shape, rate)
+}
+curve(likelihood, to = xmax, yaxs = "i", bty = "l",
+      n = 1000, ylim = c(0, posterior_height), ylab = "Probability")
+```
+
+This gives us all the ways that we could have gotten zero, weighted by their 
+probability. If we want the total probability associated with zero, we "just" 
+need to add up those weights. Adding up all the possible weights gives us
+this integral
+
+$$\int_0^\infty p(k=0|\lambda)~~p(\lambda|\alpha\beta)~~d\lambda,$$
+
+where
+$p(k|\lambda)=\frac{\lambda^k e^{-\lambda}}{k!}$ (i.e. the Poisson likelihood) and $p(\lambda|\alpha,\beta)=\frac{\beta^\alpha}{\Gamma(\alpha)}x^{\alpha-1}e^{-\beta \lambda}$ (i.e. the gamma likelihood).
+
+Fortunately, I chose an example where this integral is known: it's "just" the 
+negative binomial distribution's probability mass function, i.e. 
+
+$$p(k|p,\alpha)={{k + \alpha - 1}\choose{k}} (1-p)^\alpha p^k.$$
+
+where $p=1 / (1 + 1/\beta).$ If you happen to work exclusively with special 
+cases (called conjugate distributions) whose integrals you can look up in a 
+textbook, then this is as far as you need to read.  But this strategy doesn't
+work in general: if we have uncertainty about the values of $\alpha$ and 
+$\beta$, or if the intensities come from some other distribution like the 
+lognormal, or if we wanted to include additional prior information about 
+$\lambda$, or if we wanted to integrate out $\lambda$ and another parameter
+at the same time, we'd be stuck with something we couldn't compute.
+
+In short, we'll have to use some kind of approximation pretty often.
+
+# How to avoid integrating
+
+## Numerical integration, part 1: Newton–Cotes
+
+If you've taken a calculus class that covers integration, you might remember 
+"the rectangle rule", "the trapezoid rule", and/or "Simpson's rule". These
+methods all estimate the area under a curve by examining the height of the curve
+(and possibly its slope and other derivatives) at a series of closely-spaced 
+points. This gives an approximation of the curve's shape; calculating the area
+under our approximation gives us an estimate of the area under the original 
+curve.
+
+This is rarely the best method to use in statistics (especially when integrating
+over multiple dimensions at once), but it is one of the easiest ones to 
+understand.
+
+```{r}
+delta = 0.5
+lambda_sequence = seq(0, xmax, delta)
+rect_lik = dpois(0, lambda_sequence) * dgamma(lambda_sequence, shape, rate)
+rect_xmin = lambda_sequence - delta / 2
+rect_xmax = lambda_sequence + delta / 2
+
+plot(NULL, xlim = c(0, xmax), ylim = c(0, posterior_height))
+rect(rect_xmin, 0, rect_xmax, rect_lik)
+curve(dpois(0, x) * dgamma(x, shape, rate), add = TRUE)
+
+sum(rect_lik) * delta
+dnbinom(0, size = shape, prob = prob)
+```
+
+
+## Monte Carlo
+
+This is of the most commonly-used approaches, especially in Bayesian statistics.
+The underlying idea is straightforward: Instead using *all* possible values for 
+$\lambda$, work with a representative sample.
+
+Here, we know what the distribution of $\lambda$ is, so it's easy to generate
+10 million representative samples and determine their Poisson likelihoods.
+The answer we get this way agrees closely with the correct answer, generated
+by the negative binomial distribution.
+
+```{r}
+N = 10000000
+random_lambdas = rgamma(N, shape, rate)
+mean(dpois(0, random_lambdas))
+dnbinom(0, size = shape, prob = prob)
+```
+
+In practice, it's usally hard to sample from the parameter distribution,
+and fancier versions of this approach are needed.
+
+## Laplace approximation
+
+```{r}
+log_likelihood_log_scale = function(log_lambda) {
+  log(likelihood(exp(log_lambda)))
+}
+mle_log = optimize(log_likelihood_log_scale, c(-10, 10), maximum = TRUE)$maximum
+sigma_log = 1/sqrt(-numDeriv::hessian(log_likelihood_log_scale, mle_log))
+
+log_lambda_sequence = seq(log(1/xmax), log(xmax), length = 1000)
+
+laplace_amount = likelihood(exp(mle_log)) / dnorm(mle_log, mle_log, sigma_log)
+laplace_amount2 = likelihood(exp(mle_log)) / dlnorm(exp(mle_log), mle_log, sigma_log)
+
+curve(laplace_amount * dnorm(log(x), mle_log, sigma_log), add = FALSE, n = 1000, 
+      from = .01, to = xmax, log = "x", ylab = "density",
+      ylim = c(0, posterior_height))
+curve(likelihood(x), add = TRUE, col = "blue")
+
+# Natural scale
+curve(laplace_amount2 * dlnorm(x, mle_log, sigma_log), add = FALSE, n = 1000, 
+      from = .01, to = xmax, ylab = "density",
+      ylim = c(0, posterior_height))
+curve(likelihood(x), add = TRUE, col = "blue")
+
+
+laplace_amount2
+```
+
+* Wald approximation, often used for margin of error
+* Used by `glm` function for confidence intervals
+
+
+## Numerical integration, part 2: Gaussian quadrature & Gauss-Hermite quadrature
+
+```{r}
+library(fastGHQuad)
+
+sigma = 1/sqrt(-numDeriv::hessian(
+  function(x)log_likelihood_log_scale(exp(x)), 
+  exp(mle_log)))
+
+ghquad = function(i){
+  aghQuad(
+    function(x){
+      sapply(
+        x,
+        function(lambda){
+          if (lambda > 0) {
+            likelihood(lambda)
+          }else{
+            0
+          }
+        }
+      )
+    }, 
+    muHat = exp(mle_log), 
+    sigmaHat = sigma_log, 
+    rule = gaussHermiteData(i))
+}
+
+plot(sapply(1:50, ghquad))
+abline(h = dnbinom(0, size = shape, prob = prob))
+```
+
+## Variational approximation
+
+## Numerical integration, part 3: Bayesian Quadrature
+
+
+
